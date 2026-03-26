@@ -333,6 +333,144 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+// ── R2 tools ────────────────────────────────────────────────────────────────
+// Lazy-load the compiled r2.js from the host project (has its own @aws-sdk).
+// Env vars (R2_ACCOUNT_ID etc.) are already injected into the container.
+
+interface R2ClientLike {
+  read(key: string): Promise<string>;
+  download(key: string): Promise<Buffer>;
+  upload(key: string, body: Buffer, contentType?: string): Promise<string>;
+  list(prefix?: string): Promise<Array<{ key: string | undefined; size: number; lastModified: Date }>>;
+  presign(key: string, ttlSeconds?: number): Promise<string>;
+}
+
+interface R2Module {
+  getR2Client(): R2ClientLike | null;
+}
+
+let _r2Mod: R2Module | null = null;
+async function r2(): Promise<R2ClientLike | null> {
+  if (!_r2Mod) {
+    try {
+      _r2Mod = (await import('/workspace/project/dist/r2.js')) as R2Module;
+    } catch {
+      return null;
+    }
+  }
+  return _r2Mod.getR2Client();
+}
+
+server.tool(
+  'r2_read',
+  'Read a text file from your private R2 bucket. Returns file contents as a string.',
+  {
+    key: z.string().describe('Object key in the private bucket (e.g. "memory/MEMORY.md")'),
+    max_bytes: z.number().optional().describe('Truncate output to this many bytes (default: 65536)'),
+  },
+  async (args) => {
+    const client = await r2();
+    if (!client) {
+      return { content: [{ type: 'text' as const, text: 'R2 not configured.' }], isError: true };
+    }
+    try {
+      const buf = await client.download(args.key);
+      const limit = args.max_bytes ?? 65536;
+      const text = buf.slice(0, limit).toString('utf-8');
+      const truncated = buf.length > limit ? `\n[truncated: ${buf.length} bytes total]` : '';
+      return { content: [{ type: 'text' as const, text: text + truncated }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'r2_upload',
+  'Upload text content to your private R2 bucket.',
+  {
+    key: z.string().describe('Object key to write (e.g. "memory/MEMORY.md", "notes/todo.txt")'),
+    content: z.string().describe('Text content to upload'),
+    content_type: z.string().optional().describe('MIME type (default: text/plain)'),
+  },
+  async (args) => {
+    const client = await r2();
+    if (!client) {
+      return { content: [{ type: 'text' as const, text: 'R2 not configured.' }], isError: true };
+    }
+    try {
+      await client.upload(args.key, Buffer.from(args.content, 'utf-8'), args.content_type ?? 'text/plain; charset=utf-8');
+      return { content: [{ type: 'text' as const, text: `Uploaded: ${args.key} (${Buffer.byteLength(args.content)} bytes)` }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'r2_list',
+  'List files in your private R2 bucket, optionally filtered by prefix.',
+  {
+    prefix: z.string().optional().describe('Filter by prefix (e.g. "memory/" to list memory files)'),
+  },
+  async (args) => {
+    const client = await r2();
+    if (!client) {
+      return { content: [{ type: 'text' as const, text: 'R2 not configured.' }], isError: true };
+    }
+    try {
+      const objects = await client.list(args.prefix);
+      if (objects.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No files found.' }] };
+      }
+      const lines = objects.map((o) => {
+        const size = o.size < 1024 ? `${o.size}B` : `${(o.size / 1024).toFixed(1)}KB`;
+        const date = o.lastModified.toISOString().slice(0, 10);
+        return `${o.key ?? '?'} (${size}, ${date})`;
+      });
+      return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'r2_share',
+  'Generate a temporary presigned URL to share a file from your private R2 bucket.',
+  {
+    key: z.string().describe('Object key to share'),
+    ttl_seconds: z.number().optional().describe('Link expiry in seconds (default: 86400 = 24h)'),
+  },
+  async (args) => {
+    const client = await r2();
+    if (!client) {
+      return { content: [{ type: 'text' as const, text: 'R2 not configured.' }], isError: true };
+    }
+    try {
+      const url = await client.presign(args.key, args.ttl_seconds ?? 86400);
+      const ttl = args.ttl_seconds ?? 86400;
+      const hours = ttl / 3600;
+      return { content: [{ type: 'text' as const, text: `Presigned URL (expires in ${hours}h):\n${url}` }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+// ── Transport ────────────────────────────────────────────────────────────────
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);
